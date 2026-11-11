@@ -7,8 +7,6 @@
 // catInd), which the public Tapir commands do not expose. Diagnoses CreateZones answering
 // "Failed to create new Zone" in a project whose Zone defaults point at a missing stamp.
 
-namespace TapirCommand {
-
 class TfgGetZoneToolDefaultsCommand : public CommandBase
 {
 public:
@@ -28,5 +26,3 @@ public:
     virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
-
-}

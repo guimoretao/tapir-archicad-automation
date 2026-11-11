@@ -14,8 +14,6 @@
 // fails with the bare "Failed to create new Zone", whatever category it names. These commands
 // show that state and let a script point the defaults at a loaded stamp.
 
-namespace TapirCommand {
-
 static void SetZoneDefaultsHeader (API_Element& element)
 {
     element = {};
@@ -405,6 +403,4 @@ GS::ObjectState TfgSetZoneToolDefaultsCommand::Execute (const GS::ObjectState& p
     response.Add ("previousLibInd", previousLibInd);
     response.Add ("zoneToolDefaults", ZoneDefaultsReport (readErr));
     return response;
-}
-
 }
