@@ -1,0 +1,34 @@
+# TFG fork: builds only the Archicad 29 macOS add-on, unsigned (no secrets).
+name: TFG build AC29 Mac
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tfg/zone-defaults
+
+jobs:
+  build_mac_ac29:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Download Development Kit
+      run: python3 archicad-addon/Tools/download_and_unzip.py https://github.com/GRAPHISOFT/archicad-api-devkit/releases/download/29.3000/API.Development.Kit.MAC.29.3000.zip archicad-addon/Build/DevKits/AC29
+    - name: Generate Project
+      run: cmake -B archicad-addon/Build -G "Xcode" -DAC_VERSION=29 -DAC_API_DEVKIT_DIR="archicad-addon/Build/DevKits/AC29/Support" archicad-addon
+    - name: Build RelWithDebInfo
+      run: cmake --build archicad-addon/Build --config RelWithDebInfo -- -quiet
+    - name: Inspect bundle
+      run: |
+        B=archicad-addon/Build/RelWithDebInfo/TapirAddOn_AC29_Mac.bundle
+        ls -la "$B/Contents/MacOS"
+        codesign -dv "$B" || true
+        strings "$B/Contents/MacOS/"* | grep -E "TfgGetZoneToolDefaults|TfgSetZoneToolDefaults" | sort -u
+    - name: Create zip file
+      run: ditto -c -k --keepParent archicad-addon/Build/RelWithDebInfo/TapirAddOn_AC29_Mac.bundle archicad-addon/Build/RelWithDebInfo/TapirAddOn_AC29_Mac.zip
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TapirAddOn_AC29_Mac_tfg
+        path: archicad-addon/Build/RelWithDebInfo/TapirAddOn_AC29_Mac.zip

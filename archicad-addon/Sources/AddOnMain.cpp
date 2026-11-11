@@ -34,6 +34,7 @@
 #include "ElementGDLParameterCommands.hpp"
 #include "ElementURLReferenceCommands.hpp"
 #include "ElementCreationCommands.hpp"
+#include "TfgZoneDefaultsCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "Model3DCommands.hpp"
 #include "ElementGroupingCommands.hpp"
@@ -1179,6 +1180,14 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<CreateZonesCommand> (
             elementCommands, "1.1.8",
             "Creates Zone elements based on the given parameters. Takes the same zone settings as ModifyZones (name, number, category, zone stamp, levels, contour line and cover fill), applied by the same helpers; the polygon or reference point is only set here. An item whose area would overlap an existing Zone on the same story fails with an error naming that Zone instead of opening Archicad's modal overlap warning, unless its allowOverlap is true."
+        );
+        err |= RegisterCommand<TfgGetZoneToolDefaultsCommand> (
+            elementCommands, "2.0.0",
+            "TFG fork: reads the Zone tool defaults, including the zone stamp library part (libInd, name, main guid, missingDef), the stamp guid, the zone category with the stamp it names and whether that stamp is loaded, and the layer."
+        );
+        err |= RegisterCommand<TfgSetZoneToolDefaultsCommand> (
+            elementCommands, "2.0.0",
+            "TFG fork: sets the zone stamp of the Zone tool defaults (by library part index, main guid or name, or the stamp of the zone category) and optionally the zone category. The stamp parameters become the defaults of the new stamp."
         );
         err |= RegisterCommand<CreatePolylinesCommand> (
             elementCommands, "1.1.5",
