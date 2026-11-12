@@ -329,78 +329,354 @@ GS::Optional<GS::UniString> TfgSetZoneToolDefaultsCommand::GetRawResponseSchema 
     })";
 }
 
-GS::ObjectState TfgSetZoneToolDefaultsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+// The default parameters of the library part at libInd as a memo params handle (owned by the caller).
+static GSErrCode GetStampParams (Int32 libInd, API_AddParType**& params)
 {
-    API_Element defaults;
-    SetZoneDefaultsHeader (defaults);
-    GSErrCode err = ACAPI_Element_GetDefaults (&defaults, nullptr);
-    if (err != NoError) {
-        return CreateErrorResponse (err, "Failed to read the Zone tool defaults.");
+    params = nullptr;
+    double a = 0.0;
+    double b = 0.0;
+    Int32 addParNum = 0;
+    const GSErrCode err = ACAPI_LibraryPart_GetParams (libInd, &a, &b, &addParNum, &params);
+    if (err != NoError && params != nullptr) {
+        ACAPI_DisposeAddParHdl (&params);
+        params = nullptr;
     }
-    const Int32 previousLibInd = defaults.zone.libInd;
+    return err;
+}
 
-    API_Element mask = {};
-    ACAPI_ELEMENT_MASK_CLEAR (mask);
-    bool anyChange = false;
-
+// Resolves the stamp (stamp object, or the stamp of the category with stampFromCategory) and the
+// optional category. libInd 0 = no stamp change asked.
+static GS::Optional<GS::ObjectState> ResolveStampAndCategory (const GS::ObjectState& parameters, Int32& libInd, API_AttributeIndex& catInd, bool& hasCategory)
+{
+    libInd = 0;
+    hasCategory = false;
     const GS::ObjectState* categoryId = parameters.Get ("categoryAttributeId");
     if (categoryId != nullptr) {
-        const API_AttributeIndex catInd = GetAttributeIndexFromGuid (API_ZoneCatID, GetGuidFromObjectState (*categoryId));
+        catInd = GetAttributeIndexFromGuid (API_ZoneCatID, GetGuidFromObjectState (*categoryId));
         if (GetAttributeIndex (catInd) <= 0) {
             return CreateErrorResponse (APIERR_BADID, "Zone category not found for categoryAttributeId.");
         }
-        defaults.zone.catInd = catInd;
-        ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, catInd);
-        anyChange = true;
+        hasCategory = true;
     }
-
-    Int32 newLibInd = 0;
     const GS::ObjectState* stamp = parameters.Get ("stamp");
     bool stampFromCategory = false;
     parameters.Get ("stampFromCategory", stampFromCategory);
+    GS::UniString errMessage;
     if (stamp != nullptr) {
-        GS::UniString errMessage;
-        err = FindStampLibraryPart (*stamp, newLibInd, errMessage);
+        const GSErrCode err = FindStampLibraryPart (*stamp, libInd, errMessage);
         if (err != NoError) {
             return CreateErrorResponse (err, errMessage);
         }
     } else if (stampFromCategory) {
         API_Attribute attr = {};
         attr.header.typeID = API_ZoneCatID;
-        attr.header.index = defaults.zone.catInd;
-        err = ACAPI_Attribute_Get (&attr);
+        if (hasCategory) {
+            attr.header.index = catInd;
+        } else {
+            API_Element defaults;
+            SetZoneDefaultsHeader (defaults);
+            const GSErrCode defErr = ACAPI_Element_GetDefaults (&defaults, nullptr);
+            if (defErr != NoError) {
+                return CreateErrorResponse (defErr, GS::UniString::Printf ("ACAPI_Element_GetDefaults (no memo) = %d", (int) defErr));
+            }
+            attr.header.index = defaults.zone.catInd;
+        }
+        const GSErrCode err = ACAPI_Attribute_Get (&attr);
         if (err != NoError) {
-            return CreateErrorResponse (err, "Failed to read the zone category.");
+            return CreateErrorResponse (err, GS::UniString::Printf ("ACAPI_Attribute_Get (zone category) = %d", (int) err));
         }
         GS::ObjectState byGuid;
         byGuid.Add ("guid", APIGuidToString (attr.zoneCat.stampMainGuid));
-        GS::UniString errMessage;
-        err = FindStampLibraryPart (byGuid, newLibInd, errMessage);
-        if (err != NoError) {
-            return CreateErrorResponse (err, GS::UniString ("The stamp of the zone category is not loaded: ") + errMessage);
+        const GSErrCode findErr = FindStampLibraryPart (byGuid, libInd, errMessage);
+        if (findErr != NoError) {
+            return CreateErrorResponse (findErr, GS::UniString ("The stamp of the zone category is not loaded: ") + errMessage);
         }
     }
-    if (newLibInd > 0) {
-        defaults.zone.libInd = newLibInd;
-        ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, libInd);
-        anyChange = true;
+    return {};
+}
+
+// One way of writing the Zone tool defaults; every ACAPI code goes into the attempt record.
+enum class SetStrategy { MemoNewParams, MemoNewParamsUndoable, FullMaskNewParamsUndoable, ParamsOnlyMemoUndoable, NullMemoUndoable };
+
+static GSErrCode TrySetZoneDefaults (SetStrategy strategy, Int32 libInd, bool hasCategory, const API_AttributeIndex& catInd, GS::ObjectState& attempt)
+{
+    const char* names[] = { "memoNewParams", "memoNewParamsUndoable", "fullMaskNewParamsUndoable", "paramsOnlyMemoUndoable", "nullMemoUndoable" };
+    attempt.Add ("strategy", GS::UniString (names[static_cast<int> (strategy)]));
+
+    API_Element defaults;
+    SetZoneDefaultsHeader (defaults);
+    API_ElementMemo memo = {};
+    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+
+    const bool wantsFullMemo = strategy == SetStrategy::MemoNewParams || strategy == SetStrategy::MemoNewParamsUndoable || strategy == SetStrategy::FullMaskNewParamsUndoable;
+    GSErrCode err = NoError;
+    if (wantsFullMemo) {
+        err = ACAPI_Element_GetDefaults (&defaults, &memo);
+        attempt.Add ("getDefaultsWithMemo", static_cast<Int32> (err));
+        if (err != NoError) {
+            ACAPI_DisposeElemMemoHdls (&memo);
+            memo = {};
+            SetZoneDefaultsHeader (defaults);
+        }
+    }
+    if (!wantsFullMemo || err != NoError) {
+        err = ACAPI_Element_GetDefaults (&defaults, nullptr);
+        attempt.Add ("getDefaultsNoMemo", static_cast<Int32> (err));
+        if (err != NoError) {
+            return err;
+        }
+    }
+    attempt.Add ("oldLibInd", defaults.zone.libInd);
+
+    if (strategy != SetStrategy::NullMemoUndoable && libInd > 0) {
+        API_AddParType** params = nullptr;
+        err = GetStampParams (libInd, params);
+        attempt.Add ("getParams", static_cast<Int32> (err));
+        if (err != NoError) {
+            return err;
+        }
+        if (memo.params != nullptr) {
+            ACAPI_DisposeAddParHdl (&memo.params);
+        }
+        memo.params = params;
+        attempt.Add ("newParamCount", static_cast<Int32> (BMGetHandleSize (reinterpret_cast<GSHandle> (params)) / sizeof (API_AddParType)));
     }
 
-    if (!anyChange) {
+    API_Element mask = {};
+    if (strategy == SetStrategy::FullMaskNewParamsUndoable) {
+        ACAPI_ELEMENT_MASK_SETFULL (mask);
+    } else {
+        ACAPI_ELEMENT_MASK_CLEAR (mask);
+    }
+    if (libInd > 0) {
+        defaults.zone.libInd = libInd;
+        ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, libInd);
+    }
+    if (hasCategory) {
+        defaults.zone.catInd = catInd;
+        ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, catInd);
+    }
+
+    API_ElementMemo* memoPtr = (strategy == SetStrategy::NullMemoUndoable) ? nullptr : &memo;
+    if (strategy == SetStrategy::MemoNewParams) {
+        err = ACAPI_Element_ChangeDefaults (&defaults, memoPtr, &mask);
+        attempt.Add ("changeDefaults", static_cast<Int32> (err));
+        return err;
+    }
+    GSErrCode innerErr = NoError;
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("TFG Zone defaults", [&] () -> GSErrCode {
+        innerErr = ACAPI_Element_ChangeDefaults (&defaults, memoPtr, &mask);
+        return innerErr;
+    });
+    attempt.Add ("changeDefaults", static_cast<Int32> (innerErr));
+    attempt.Add ("callUndoableCommand", static_cast<Int32> (undoErr));
+    return innerErr != NoError ? innerErr : undoErr;
+}
+
+GS::ObjectState TfgSetZoneToolDefaultsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    Int32 libInd = 0;
+    API_AttributeIndex catInd = {};
+    bool hasCategory = false;
+    const GS::Optional<GS::ObjectState> resolveError = ResolveStampAndCategory (parameters, libInd, catInd, hasCategory);
+    if (resolveError.HasValue ()) {
+        return resolveError.Get ();
+    }
+    if (libInd <= 0 && !hasCategory) {
         return CreateErrorResponse (APIERR_BADPARS, "Nothing to change: give stamp, stampFromCategory or categoryAttributeId.");
     }
 
-    // memo nullptr: for a library part based default Archicad then takes the default
-    // parameters of the (new) library part (ACAPI_Element_ChangeDefaults remarks).
-    err = ACAPI_Element_ChangeDefaults (&defaults, nullptr, &mask);
-    if (err != NoError) {
-        return CreateErrorResponse (err, "ACAPI_Element_ChangeDefaults refused the change of the Zone tool defaults.");
+    GS::Array<GS::ObjectState> attempts;
+    const SetStrategy strategies[] = { SetStrategy::MemoNewParams, SetStrategy::MemoNewParamsUndoable, SetStrategy::FullMaskNewParamsUndoable, SetStrategy::ParamsOnlyMemoUndoable, SetStrategy::NullMemoUndoable };
+    GSErrCode lastErr = APIERR_GENERAL;
+    bool success = false;
+    GS::UniString summary;
+    for (const SetStrategy strategy : strategies) {
+        GS::ObjectState attempt;
+        lastErr = TrySetZoneDefaults (strategy, libInd, hasCategory, catInd, attempt);
+        attempt.Add ("result", static_cast<Int32> (lastErr));
+        attempts.Push (attempt);
+        summary += GS::UniString::Printf ("[%d]=%d ", (int) attempts.GetSize (), (int) lastErr);
+        if (lastErr == NoError) {
+            success = true;
+            break;
+        }
     }
 
+    GS::ObjectState response = success
+        ? GS::ObjectState ("success", true)
+        : CreateErrorResponse (lastErr, GS::UniString ("ACAPI_Element_ChangeDefaults refused the change of the Zone tool defaults in every strategy: ") + summary + "(see attempts).");
+    response.Add ("newLibInd", libInd);
+    response.Add ("attempts", attempts);
     GSErrCode readErr = NoError;
-    GS::ObjectState response;
-    response.Add ("success", true);
-    response.Add ("previousLibInd", previousLibInd);
     response.Add ("zoneToolDefaults", ZoneDefaultsReport (readErr));
+    return response;
+}
+
+TfgCreateZoneWithStampCommand::TfgCreateZoneWithStampCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String TfgCreateZoneWithStampCommand::GetName () const
+{
+    return "TfgCreateZoneWithStamp";
+}
+
+GS::Optional<GS::UniString> TfgCreateZoneWithStampCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "stamp": {
+                "type": "object",
+                "description": "The zone stamp library part, by index, main guid or name (as in TfgSetZoneToolDefaults).",
+                "properties": {
+                    "index": { "type": "integer" },
+                    "guid": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "stampFromCategory": { "type": "boolean", "description": "Use the stamp of the zone category (categoryAttributeId, else the default category)." },
+            "categoryAttributeId": { "$ref": "#/AttributeId" },
+            "name": { "type": "string" },
+            "numberStr": { "type": "string" },
+            "floorIndex": { "type": "integer" },
+            "polygonCoordinates": {
+                "type": "array",
+                "description": "Outline of the manual zone (no arcs, no holes), at least 3 points.",
+                "items": { "$ref": "#/Coordinate2D" },
+                "minItems": 3
+            },
+            "stampPosition": { "$ref": "#/Coordinate2D" }
+        },
+        "additionalProperties": false,
+        "required": [ "polygonCoordinates" ]
+    })";
+}
+
+GS::Optional<GS::UniString> TfgCreateZoneWithStampCommand::GetRawResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "description": "elementId of the new Zone (or error) and the code of every ACAPI call (codes).",
+        "properties": {
+            "elementId": { "$ref": "#/ElementId" },
+            "codes": { "type": "object" }
+        },
+        "additionalProperties": true
+    })";
+}
+
+GS::ObjectState TfgCreateZoneWithStampCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    Int32 libInd = 0;
+    API_AttributeIndex catInd = {};
+    bool hasCategory = false;
+    const GS::Optional<GS::ObjectState> resolveError = ResolveStampAndCategory (parameters, libInd, catInd, hasCategory);
+    if (resolveError.HasValue ()) {
+        return resolveError.Get ();
+    }
+    if (libInd <= 0) {
+        return CreateErrorResponse (APIERR_BADPARS, "Give stamp or stampFromCategory: the zone is created with that stamp.");
+    }
+
+    GS::Array<GS::ObjectState> polygonCoordinates;
+    parameters.Get ("polygonCoordinates", polygonCoordinates);
+    if (polygonCoordinates.GetSize () >= 2 && IsSame2DCoordinate (polygonCoordinates.GetFirst (), polygonCoordinates.GetLast ())) {
+        polygonCoordinates.Pop ();
+    }
+    if (polygonCoordinates.GetSize () < 3) {
+        return CreateErrorResponse (APIERR_BADPARS, "polygonCoordinates needs at least 3 distinct points.");
+    }
+
+    GS::ObjectState codes;
+    API_Element element;
+    SetZoneDefaultsHeader (element);
+    API_ElementMemo memo = {};
+    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+
+    GSErrCode err = ACAPI_Element_GetDefaults (&element, &memo);
+    codes.Add ("getDefaultsWithMemo", static_cast<Int32> (err));
+    if (err != NoError) {
+        ACAPI_DisposeElemMemoHdls (&memo);
+        memo = {};
+        SetZoneDefaultsHeader (element);
+        err = ACAPI_Element_GetDefaults (&element, nullptr);
+        codes.Add ("getDefaultsNoMemo", static_cast<Int32> (err));
+        if (err != NoError) {
+            GS::ObjectState response = CreateErrorResponse (err, GS::UniString::Printf ("ACAPI_Element_GetDefaults = %d", (int) err));
+            response.Add ("codes", codes);
+            return response;
+        }
+    }
+    codes.Add ("defaultsLibInd", element.zone.libInd);
+
+    // Only the outline: the memo of the defaults may carry other handles, drop them all.
+    API_AddParType** params = nullptr;
+    err = GetStampParams (libInd, params);
+    codes.Add ("getParams", static_cast<Int32> (err));
+    if (err != NoError) {
+        GS::ObjectState response = CreateErrorResponse (err, GS::UniString::Printf ("ACAPI_LibraryPart_GetParams (%d) = %d", (int) libInd, (int) err));
+        response.Add ("codes", codes);
+        return response;
+    }
+    ACAPI_DisposeElemMemoHdls (&memo);
+    memo = {};
+    memo.params = params;
+
+    element.zone.libInd = libInd;
+    if (hasCategory) {
+        element.zone.catInd = catInd;
+    }
+    parameters.Get ("floorIndex", element.header.floorInd);
+    SetUCharProperty (&parameters, "name", element.zone.roomName);
+    SetUCharProperty (&parameters, "numberStr", element.zone.roomNoStr);
+    element.zone.manual = true;
+    element.zone.poly.nCoords = polygonCoordinates.GetSize () + 1;
+    element.zone.poly.nSubPolys = 1;
+    element.zone.poly.nArcs = 0;
+    memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((element.zone.poly.nCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+    memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle ((element.zone.poly.nSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+    memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (0, ALLOCATE_CLEAR, 0));
+    Int32 iCoord = 1;
+    Int32 iArc = 0;
+    Int32 iPends = 1;
+    AddPolyToMemo (polygonCoordinates, GS::Array<GS::ObjectState> (), iCoord, iArc, iPends, memo);
+
+    const GS::ObjectState* stampPosition = parameters.Get ("stampPosition");
+    if (stampPosition != nullptr) {
+        element.zone.pos = Get2DCoordinateFromObjectState (*stampPosition);
+    } else {
+        API_Coord centre = { 0.0, 0.0 };
+        for (const GS::ObjectState& c : polygonCoordinates) {
+            const API_Coord p = Get2DCoordinateFromObjectState (c);
+            centre.x += p.x;
+            centre.y += p.y;
+        }
+        centre.x /= polygonCoordinates.GetSize ();
+        centre.y /= polygonCoordinates.GetSize ();
+        element.zone.pos = centre;
+    }
+    element.zone.refPos = element.zone.pos;
+
+    GSErrCode createErr = NoError;
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("TFG Create Zone", [&] () -> GSErrCode {
+        createErr = ACAPI_Element_Create (&element, &memo);
+        return createErr;
+    });
+    codes.Add ("elementCreate", static_cast<Int32> (createErr));
+    codes.Add ("callUndoableCommand", static_cast<Int32> (undoErr));
+
+    GS::ObjectState response;
+    if (createErr != NoError || undoErr != NoError) {
+        const GSErrCode e = createErr != NoError ? createErr : undoErr;
+        response = CreateErrorResponse (e, GS::UniString::Printf ("ACAPI_Element_Create = %d, ACAPI_CallUndoableCommand = %d", (int) createErr, (int) undoErr));
+    } else {
+        response.Add ("elementId", CreateGuidObjectState (element.header.guid));
+    }
+    response.Add ("libInd", libInd);
+    response.Add ("codes", codes);
     return response;
 }

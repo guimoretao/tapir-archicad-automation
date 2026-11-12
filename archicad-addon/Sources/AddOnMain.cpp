@@ -1189,6 +1189,10 @@ GSErrCode Initialize (void)
             elementCommands, "2.0.0",
             "TFG fork: sets the zone stamp of the Zone tool defaults (by library part index, main guid or name, or the stamp of the zone category) and optionally the zone category. The stamp parameters become the defaults of the new stamp."
         );
+        err |= RegisterCommand<TfgCreateZoneWithStampCommand> (
+            elementCommands, "2.0.0",
+            "TFG fork: creates one manual Zone with the given zone stamp (library part index, main guid or name, or the stamp of the zone category), its default parameters and the outline, without depending on the stamp of the Zone tool defaults. Returns the code of every Archicad API call."
+        );
         err |= RegisterCommand<CreatePolylinesCommand> (
             elementCommands, "1.1.5",
             "Creates Polyline elements based on the given parameters."
